@@ -514,8 +514,41 @@ if ($MaxSizeMB -gt 0) {
             }
         }
 
-        if ($bonusReclaimedKB -lt $excessKB) {
-            Write-Warning "MaxSize: bonus pass freed $(Format-Size $bonusReclaimedKB) but target needed $(Format-Size $excessKB). Cache remains over -MaxSizeMB."
+        # In -WhatIf mode we can't measure real disk impact, so warn here based on
+        # tracked accounting. Post-snapshot below handles the non-WhatIf case with
+        # the honest disk number.
+        if ($whatIf -and $bonusReclaimedKB -lt $excessKB) {
+            Write-Warning "MaxSize: bonus pass would free $(Format-Size $bonusReclaimedKB) tracked but target needs $(Format-Size $excessKB). Actual disk impact is typically higher when content is extracted/staged inside cache folders."
+        }
+    }
+}
+
+# --- post-cleanup disk snapshot ----------------------------------------------
+# CIM/COM ContentSize tracks the downloaded payload size, not what's extracted
+# or staged inside each cache folder. After any real removals, re-walk the cache
+# root for the honest reclaim number and refresh the over-target warning.
+
+$realRemovals = @($Script:Records | Where-Object Status -eq 'Removed').Count
+if ($realRemovals -gt 0) {
+    $finalDiskKB = Get-FolderSizeKB -Path $CachePath
+    $actualReclaimKB = [Math]::Max(0, $StartDiskKB - $finalDiskKB)
+    $trackedReclaimKB = ($Script:Records | Where-Object Status -eq 'Removed' | Measure-Object SizeKB -Sum).Sum
+    if (-not $trackedReclaimKB) { $trackedReclaimKB = 0 }
+
+    $afterLine = "Cache utilization after: $(Format-Utilization -DiskKB $finalDiskKB -ConfiguredMaxMB $ConfiguredMaxMB)"
+    Write-Verbose $afterLine
+    Write-CMTraceLog -Message $afterLine -Severity Info
+
+    if ($actualReclaimKB -ne $trackedReclaimKB) {
+        $reclaimLine = "Reclaim: actual $(Format-Size $actualReclaimKB) on disk vs $(Format-Size $trackedReclaimKB) tracked (difference is extracted/staged content)."
+        Write-Verbose $reclaimLine
+        Write-CMTraceLog -Message $reclaimLine -Severity Info
+    }
+
+    if ($MaxSizeMB -gt 0) {
+        $maxKB = [long]$MaxSizeMB * 1024
+        if ($finalDiskKB -gt $maxKB) {
+            Write-Warning "MaxSize: cache still over target - actual disk $(Format-Size $finalDiskKB) > target $(Format-Size $maxKB). Consider -IncludePersisted/-IncludeInUse if appropriate."
         }
     }
 }
