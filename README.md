@@ -11,7 +11,8 @@ PowerShell script that removes old, unused content from the SCCM/CCM client cach
 ## Usage
 
 ```powershell
-.\Clear-CCMCache.ps1 [-Days <int>] [-IncludePersisted] [-IncludeInUse] `
+.\Clear-CCMCache.ps1 [-Days <int>] [-MaxSizeMB <int>] `
+                     [-IncludePersisted] [-IncludeInUse] `
                      [-PassThru] [-LogPath <string>] [-NoLog] `
                      [-WhatIf] [-Confirm] [-Verbose]
 ```
@@ -19,6 +20,7 @@ PowerShell script that removes old, unused content from the SCCM/CCM client cach
 | Parameter           | Description |
 | ------------------- | --- |
 | `-Days`             | Days an item must be unreferenced before removal. Default `30`, range `1`-`3650`. |
+| `-MaxSizeMB`        | Target maximum cache size in MB. If after the days-based pass the cache is still over this size, removes oldest "recent" entries until under target. `0` (default) disables. Persisted/in-use filters still apply. |
 | `-IncludePersisted` | Also remove entries flagged `PersistInCache=$true`. Off by default — deleting persisted content typically triggers redownload on the next policy evaluation. |
 | `-IncludeInUse`     | Also attempt to remove entries with `ReferenceCount > 0`. Off by default — in-use content is being read by a running install or task sequence. The COM interface may still refuse the delete. |
 | `-PassThru`         | Emit per-item records (`Timestamp, Status, Path, SizeKB, Source, Reason, Error`) on the success stream. Off by default to keep host output quiet. |
@@ -39,6 +41,9 @@ PowerShell script that removes old, unused content from the SCCM/CCM client cach
 
 # Run a 14-day cleanup with verbose output
 .\Clear-CCMCache.ps1 -Days 14 -Verbose
+
+# Shrink the cache to 8 GB, removing oldest recent entries if days-based isn't enough
+.\Clear-CCMCache.ps1 -MaxSizeMB 8192 -WhatIf -Verbose
 
 # Clean and export a per-item audit record
 .\Clear-CCMCache.ps1 -PassThru | Export-Csv .\cleanup.csv -NoTypeInformation

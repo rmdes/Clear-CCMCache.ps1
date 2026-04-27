@@ -43,7 +43,8 @@ Reading the script top-to-bottom mirrors execution order.
 4. **Gather**: enumerate cache elements via COM (deletion handles + locations + `ContentSize`) and `CacheInfoEx` via CIM (rich filter properties — see the COM/CIM split below). Index CIM entries by `CacheId` for O(1) join with COM `CacheElementId`.
 5. **Main pass**: for each COM element, look up its CIM twin (or fall back to COM-only when missing) and skip if (a) idle ≤ `-Days`, (b) `PersistInCache` and not `-IncludePersisted`, or (c) `ReferenceCount > 0` and not `-IncludeInUse`. Survivors are deleted via `$CacheCom.DeleteCacheElement($id)`. Every decision (Removed / WouldRemove / Skipped / Failed) becomes a record via `Add-Record`.
 6. **Orphan reconciliation** (best effort): re-query CIM, enumerate disk; disk folders with no CIM record → `Remove-Item`; CIM records with no folder → try COM `DeleteCacheElement` first, fall back to `Remove-CimInstance`. Same `Add-Record` pattern.
-7. **Summary**: aggregate `$Script:Records` for verbose summary + CMTrace footer. `Removed.Count`, `reclaimed = sum(SizeKB where Status=Removed)`, plus `WouldRemove`/`projected` in `-WhatIf` mode.
+7. **`-MaxSizeMB` bonus pass** (only when `MaxSizeMB > 0`): if `StartDiskKB - reclaimed-so-far` still exceeds the target, remove `$RecentCandidates` (collected in the main pass) sorted by `LastReferenced` ascending, oldest first, until projected disk ≤ target or candidates exhausted. Persisted/in-use entries are NOT collected as candidates — a hard size target should not break running deployments; `-IncludePersisted` / `-IncludeInUse` are still required to override those filters.
+8. **Summary**: aggregate `$Script:Records` for verbose summary + CMTrace footer. `Removed.Count`, `reclaimed = sum(SizeKB where Status=Removed)`, plus `WouldRemove`/`projected` in `-WhatIf` mode.
 
 ## Non-obvious constraints
 

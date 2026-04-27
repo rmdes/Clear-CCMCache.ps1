@@ -32,6 +32,14 @@ Use -WhatIf to preview, or -Confirm to be prompted per item.
 .PARAMETER Days
 Number of days an item must be unreferenced before it is considered stale. Default: 30.
 
+.PARAMETER MaxSizeMB
+Target maximum cache size in MB. After the days-based pass, if the cache is still
+projected to exceed this size, remove "recent" entries oldest-first until under target
+or no more eligible candidates remain. 0 (default) disables the bonus pass.
+Persisted and in-use filters still apply — set -IncludePersisted/-IncludeInUse to
+override them. Useful when the cache is over its configured cap and the days-based
+filter alone can't free enough space.
+
 .PARAMETER IncludePersisted
 Also remove entries flagged PersistInCache = $true. Off by default.
 
@@ -75,6 +83,9 @@ Run `Get-Help .\Clear-CCMCache.ps1 -Detailed` for full help.
 param(
     [ValidateRange(1, 3650)]
     [int]$Days = 30,
+
+    [ValidateRange(0, [int]::MaxValue)]
+    [int]$MaxSizeMB = 0,
 
     [switch]$IncludePersisted,
     [switch]$IncludeInUse,
@@ -322,6 +333,11 @@ Write-Verbose "Indexed $($CimById.Count) CIM cache entries; enumerated $($ComEle
 
 $Now = Get-Date
 
+# Recent-but-deletable candidates collected for the optional -MaxSizeMB bonus pass.
+# Persisted/in-use entries are NOT collected: a hard size target should not override
+# safety filters that prevent breaking running deployments.
+$RecentCandidates = [System.Collections.Generic.List[object]]::new()
+
 foreach ($com in $ComElements) {
     $id       = $com.CacheElementId
     $location = $com.Location
@@ -344,6 +360,17 @@ foreach ($com in $ComElements) {
 
     $idleDays = ($Now - $lastRef).Days
     if ($idleDays -le $Days) {
+        $eligibleForMaxSize = -not ($persist -and -not $IncludePersisted) -and -not ($refCount -gt 0 -and -not $IncludeInUse)
+        if ($MaxSizeMB -gt 0 -and $eligibleForMaxSize) {
+            $RecentCandidates.Add([PSCustomObject]@{
+                ComElement     = $com
+                Location       = $location
+                LastReferenced = $lastRef
+                IdleDays       = $idleDays
+                SizeKB         = $sizeKB
+                Source         = $source
+            })
+        }
         Add-Record -Status 'Skipped' -Path $location -SizeKB $sizeKB -Source $source -Reason "recent (idle $idleDays d <= $Days)"
         continue
     }
@@ -433,6 +460,55 @@ if ($RemainingCim -ne $null -and $DiskFolders -ne $null) {
             } catch {
                 Add-Record -Status 'Failed' -Path $location -SizeKB $sizeKB -Source 'orphan-cim' -Reason 'folder missing' -ErrorMsg $_.Exception.Message
             }
+        }
+    }
+}
+
+# --- bonus pass: -MaxSizeMB target enforcement ------------------------------
+# After the days-based main pass + orphan reconciliation, if the cache is still
+# projected to exceed -MaxSizeMB, remove "recent" entries oldest-first until the
+# target is met or no more eligible candidates remain. Persisted/in-use entries
+# are still excluded — a hard size target should not break running deployments.
+
+if ($MaxSizeMB -gt 0) {
+    $maxKB = [long]$MaxSizeMB * 1024
+    $reclaimedSoFarKB = (@($Script:Records | Where-Object Status -in 'Removed', 'WouldRemove') |
+        Measure-Object SizeKB -Sum).Sum
+    if (-not $reclaimedSoFarKB) { $reclaimedSoFarKB = 0 }
+    $projectedDiskKB = $StartDiskKB - $reclaimedSoFarKB
+
+    if ($projectedDiskKB -le $maxKB) {
+        Write-Verbose "MaxSize: cache projected at $(Format-Size $projectedDiskKB), target $(Format-Size $maxKB) - no bonus pass needed."
+    } elseif ($RecentCandidates.Count -eq 0) {
+        Write-Warning "MaxSize: cache projected at $(Format-Size $projectedDiskKB) (target $(Format-Size $maxKB)) but no eligible recent candidates to remove. Consider -IncludePersisted/-IncludeInUse."
+    } else {
+        $excessKB = $projectedDiskKB - $maxKB
+        $msg = "MaxSize: bonus pass - cache projected at $(Format-Size $projectedDiskKB), target $(Format-Size $maxKB), need to reclaim $(Format-Size $excessKB) more from $($RecentCandidates.Count) recent candidate(s)."
+        Write-Verbose $msg
+        Write-CMTraceLog -Message $msg -Severity Info
+
+        $sorted = $RecentCandidates | Sort-Object LastReferenced
+        $bonusReclaimedKB = 0
+        foreach ($cand in $sorted) {
+            if ($bonusReclaimedKB -ge $excessKB) { break }
+            $reason = "max-size: idle $($cand.IdleDays) d, target $MaxSizeMB MB"
+            $target = "$($cand.Location) ($reason)"
+            if (-not $PSCmdlet.ShouldProcess($target, 'Delete cache element via CCM COM interface (max-size pass)')) {
+                Add-Record -Status 'WouldRemove' -Path $cand.Location -SizeKB $cand.SizeKB -Source $cand.Source -Reason $reason
+                $bonusReclaimedKB += $cand.SizeKB
+                continue
+            }
+            try {
+                $CacheCom.DeleteCacheElement($cand.ComElement.CacheElementId)
+                Add-Record -Status 'Removed' -Path $cand.Location -SizeKB $cand.SizeKB -Source $cand.Source -Reason $reason
+                $bonusReclaimedKB += $cand.SizeKB
+            } catch {
+                Add-Record -Status 'Failed' -Path $cand.Location -SizeKB $cand.SizeKB -Source $cand.Source -Reason $reason -ErrorMsg $_.Exception.Message
+            }
+        }
+
+        if ($bonusReclaimedKB -lt $excessKB) {
+            Write-Warning "MaxSize: bonus pass freed $(Format-Size $bonusReclaimedKB) but target needed $(Format-Size $excessKB). Cache remains over -MaxSizeMB."
         }
     }
 }
