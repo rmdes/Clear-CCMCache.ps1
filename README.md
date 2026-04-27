@@ -11,15 +11,20 @@ PowerShell script that removes old, unused content from the SCCM/CCM client cach
 ## Usage
 
 ```powershell
-.\Clear-CCMCache.ps1 [-Days <int>] [-IncludePersisted] [-IncludeInUse] [-WhatIf] [-Confirm] [-Verbose]
+.\Clear-CCMCache.ps1 [-Days <int>] [-IncludePersisted] [-IncludeInUse] `
+                     [-PassThru] [-LogPath <string>] [-NoLog] `
+                     [-WhatIf] [-Confirm] [-Verbose]
 ```
 
 | Parameter           | Description |
 | ------------------- | --- |
-| `-Days`             | Days an item must be unreferenced before removal. Default `30`, range `1`–`3650`. |
+| `-Days`             | Days an item must be unreferenced before removal. Default `30`, range `1`-`3650`. |
 | `-IncludePersisted` | Also remove entries flagged `PersistInCache=$true`. Off by default — deleting persisted content typically triggers redownload on the next policy evaluation. |
 | `-IncludeInUse`     | Also attempt to remove entries with `ReferenceCount > 0`. Off by default — in-use content is being read by a running install or task sequence. The COM interface may still refuse the delete. |
-| `-WhatIf`           | Show what would be removed without making any changes. |
+| `-PassThru`         | Emit per-item records (`Timestamp, Status, Path, SizeKB, Source, Reason, Error`) on the success stream. Off by default to keep host output quiet. |
+| `-LogPath`          | Override the CMTrace log file location. Default: read from CCM client registry, fall back to `%SystemRoot%\CCM\Logs\ClearCache.log`, then to `%TEMP%\ClearCache.log`. |
+| `-NoLog`            | Disable file logging entirely. |
+| `-WhatIf`           | Show what would be removed without making any changes. Reports projected reclaimable size. |
 | `-Confirm`          | Prompt before each removal. |
 | `-Verbose`          | Per-item progress and a summary line on the verbose stream. |
 
@@ -29,15 +34,30 @@ PowerShell script that removes old, unused content from the SCCM/CCM client cach
 # Default: clean items unreferenced for more than 30 days
 .\Clear-CCMCache.ps1
 
-# Preview a 14-day cleanup, no changes made
+# Preview a 14-day cleanup, no changes made; shows projected reclaimable size
 .\Clear-CCMCache.ps1 -Days 14 -WhatIf
 
 # Run a 14-day cleanup with verbose output
 .\Clear-CCMCache.ps1 -Days 14 -Verbose
 
+# Clean and export a per-item audit record
+.\Clear-CCMCache.ps1 -PassThru | Export-Csv .\cleanup.csv -NoTypeInformation
+
 # Full help
 Get-Help .\Clear-CCMCache.ps1 -Detailed
 ```
+
+### Logging
+
+Every action (Removed / WouldRemove / Skipped / Failed) is appended to a CMTrace-formatted log alongside the rest of the CCM client logs (default `%SystemRoot%\CCM\Logs\ClearCache.log`). Open it with `CMTrace.exe` to see runs interleaved with `CcmExec.log`, `CAS.log`, etc. The log auto-rotates to `ClearCache.lo_` when it crosses 10 MB.
+
+The verbose summary line at the end of every run looks like:
+
+```
+Run finished: removed=33 reclaimed=4.21 GB skipped=7 failed=0
+```
+
+In `-WhatIf` mode it also reports `would-remove=N projected=N` so you can preview the savings before committing.
 
 ## What it does
 

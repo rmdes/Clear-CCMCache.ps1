@@ -39,9 +39,11 @@ Reading the script top-to-bottom mirrors execution order.
 
 1. **Preflight**: confirm `CcmExec` service is running, resolve the cache root from `ROOT\ccm\SoftMgmtAgent\CacheConfig` (CIM). Disk path is never hardcoded.
 2. **Bind COM**: `UIResource.UIResourceMgr` → `GetCacheInfo()`. This is the supported deletion API.
-3. **Gather**: enumerate cache elements via COM (deletion handles + locations) and `CacheInfoEx` via CIM (rich filter properties — see the COM/CIM split below). Index CIM entries by `CacheId` for O(1) join with COM `CacheElementId`.
-4. **Main pass**: for each COM element, look up its CIM twin and skip if (a) idle ≤ `-Days`, (b) `PersistInCache` and not `-IncludePersisted`, (c) `ReferenceCount > 0` and not `-IncludeInUse`, or (d) no CIM record (deferred to orphan pass). Survivors are deleted via `$CacheCom.DeleteCacheElement($id)`.
-5. **Orphan reconciliation** (best effort): re-query CIM, enumerate disk; disk folders with no CIM record → `Remove-Item`; CIM records with no folder → try COM `DeleteCacheElement` first, fall back to `Remove-CimInstance`.
+3. **Initialize logging**: resolve CMTrace log path (`HKLM:\SOFTWARE\Microsoft\CCM\Logging\@Global\LogDirectory` → `%SystemRoot%\CCM\Logs\ClearCache.log` → `%TEMP%\ClearCache.log`), rotate to `.lo_` if > 10 MB.
+4. **Gather**: enumerate cache elements via COM (deletion handles + locations + `ContentSize`) and `CacheInfoEx` via CIM (rich filter properties — see the COM/CIM split below). Index CIM entries by `CacheId` for O(1) join with COM `CacheElementId`.
+5. **Main pass**: for each COM element, look up its CIM twin (or fall back to COM-only when missing) and skip if (a) idle ≤ `-Days`, (b) `PersistInCache` and not `-IncludePersisted`, or (c) `ReferenceCount > 0` and not `-IncludeInUse`. Survivors are deleted via `$CacheCom.DeleteCacheElement($id)`. Every decision (Removed / WouldRemove / Skipped / Failed) becomes a record via `Add-Record`.
+6. **Orphan reconciliation** (best effort): re-query CIM, enumerate disk; disk folders with no CIM record → `Remove-Item`; CIM records with no folder → try COM `DeleteCacheElement` first, fall back to `Remove-CimInstance`. Same `Add-Record` pattern.
+7. **Summary**: aggregate `$Script:Records` for verbose summary + CMTrace footer. `Removed.Count`, `reclaimed = sum(SizeKB where Status=Removed)`, plus `WouldRemove`/`projected` in `-WhatIf` mode.
 
 ## Non-obvious constraints
 
