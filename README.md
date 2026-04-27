@@ -1,41 +1,61 @@
-# Clear-CCMCache PowerShell Script
+# Clear-CCMCache
 
-## Overview
+PowerShell script that removes old, unused content from the SCCM/CCM client cache (`CCMCache`) and reconciles orphaned entries between disk and the CCM client store.
 
-The Clear-CCMCache PowerShell script is designed to remove old and unused content from the CCMCache folder used by the Microsoft System Center Configuration Manager (SCCM). This folder contains files that are downloaded by SCCM for various installations, including applications, patches, and task sequences.
+## Requirements
 
-The script uses Windows Management Instrumentation (WMI) to detect and remove items from the CCMCache folder that have not been referenced for a specified number of days.
+- Windows PowerShell **5.1** or PowerShell **7+**
+- Administrative privileges
+- Microsoft Endpoint Configuration Manager (SCCM/CCM) client installed
 
 ## Usage
 
-To use the script, open a PowerShell prompt and navigate to the directory where the script file is located. Then, enter one of the following command line options:
-
 ```powershell
-.\Clear-CCMCache.ps1 [-Detect] [-Clean] [-Help] [-Days ##]
+.\Clear-CCMCache.ps1 [-Days <int>] [-WhatIf] [-Confirm] [-Verbose]
 ```
 
-- `-Detect`: Detects old and unused content in the CCMCache folder and reports the results.
-- `-Clean`: Cleans old and unused content from the CCMCache folder. If no option is provided, this is the default behavior.
-- `-Help`: Shows the help message with information about the available options.
-- `-Days`: Sets the number of days to keep files in the CCMCache folder. The default value is 30 days. This option can be used with both the `-Detect` and `-Clean` options.
+| Parameter  | Description |
+| ---------- | --- |
+| `-Days`    | Days an item must be unreferenced before removal. Default `30`, range `1`–`3650`. |
+| `-WhatIf`  | Show what would be removed without making any changes. |
+| `-Confirm` | Prompt before each removal. |
+| `-Verbose` | Per-item progress on the verbose stream. |
 
-For example, to clean content older than 14 days, run the following command:
+### Examples
 
 ```powershell
-.\Clear-CCMCache.ps1 -Clean -Days 14
+# Default: clean items unreferenced for more than 30 days
+.\Clear-CCMCache.ps1
+
+# Preview a 14-day cleanup, no changes made
+.\Clear-CCMCache.ps1 -Days 14 -WhatIf
+
+# Run a 14-day cleanup with verbose output
+.\Clear-CCMCache.ps1 -Days 14 -Verbose
+
+# Full help
+Get-Help .\Clear-CCMCache.ps1 -Detailed
 ```
+
+## What it does
+
+1. Resolves the cache path from `ROOT\ccm\SoftMgmtAgent\CacheConfig`.
+2. Removes cache entries (folder + CIM record) whose `LastReferenced` is older than `-Days`.
+3. Reconciles orphans:
+   - Folders on disk with no matching CIM record → deleted.
+   - CIM records pointing at folders that no longer exist → deleted.
+
+Every destructive step honors `-WhatIf` and `-Confirm`, and is bounded to paths under the resolved cache root as a safety guard.
 
 ## Notes
 
-- The script requires administrative privileges to run.
-- The script should be executed on the client machine where SCCM is installed.
-- The default path for the CCMCache folder is `C:\Windows\ccmcache`.
-- The script uses WMI to query and delete items from the CCMCache folder. Therefore, it may take some time to complete, depending on the size of the folder.
-- The script is provided as-is and is not supported by Microsoft.
+- The default cache path is `C:\Windows\ccmcache`, but the script always reads the actual location from CIM.
+- Uses `Get-CimInstance` / `Remove-CimInstance` (not the deprecated `Get-WmiObject`), so the script runs unchanged on PowerShell 7.
+- Provided as-is. Not supported by Microsoft.
 
 ## Contributing
 
-If you find a bug or want to suggest an improvement, feel free to open an issue or submit a pull request on GitHub.
+Bug reports and pull requests welcome.
 
 ## Acknowledgements
 

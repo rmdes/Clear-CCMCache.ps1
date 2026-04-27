@@ -1,177 +1,171 @@
+# ABOUTME: Removes old/unused content and reconciles orphaned entries in the SCCM/CCM client cache.
+# ABOUTME: Uses CIM cmdlets, so it runs unchanged on Windows PowerShell 5.1 and PowerShell 7+.
+
 <#
 .SYNOPSIS
 Clears old and unused content from the CCMCache folder.
 
 .DESCRIPTION
-This script detects and removes old and unused content from the CCMCache folder based on the specified number of days. It helps manage the storage space used by the CCMCache.
+Removes cache entries whose LastReferenced timestamp is older than -Days (folder on disk
+plus the matching CIM record), then reconciles orphans between disk and the CCM client
+store: disk folders with no CIM record are removed, and CIM records pointing at missing
+folders are removed.
 
-.PARAMETER Detect
-Detects old and unused content in the CCMCache folder without deleting.
-
-.PARAMETER Clean
-Cleans old and unused content from the CCMCache folder. If no option is provided, this is the default.
-
-.PARAMETER Help
-Shows the help message.
+Use -WhatIf to preview without making changes, or -Confirm to be prompted per item.
 
 .PARAMETER Days
-Specifies the number of days to keep files in the CCMCache folder. Default is 30 days.
+Number of days an item must be unreferenced before it is considered stale. Default: 30.
 
 .EXAMPLE
-.\Clear-CCMCache.ps1 -Detect
+.\Clear-CCMCache.ps1
+Cleans entries unreferenced for more than 30 days (default).
 
 .EXAMPLE
-.\Clear-CCMCache.ps1 -Clean
+.\Clear-CCMCache.ps1 -Days 14 -WhatIf
+Previews what a 14-day cleanup would remove, without changing anything.
 
 .EXAMPLE
-.\Clear-CCMCache.ps1 -Help
-
-.EXAMPLE
-.\Clear-CCMCache.ps1 -Clean -Days 14
-
-.EXAMPLE
-.\Clear-CCMCache.ps1 -Detect -Days 14
+.\Clear-CCMCache.ps1 -Days 14 -Verbose
+Runs a 14-day cleanup with per-item progress on the verbose stream.
 
 .NOTES
-This script is designed for administrators and developers who need to manage the CCMCache folder storage space.
-
+Requires administrative privileges and a working CCM client.
+Run `Get-Help .\Clear-CCMCache.ps1 -Detailed` for full help.
 #>
 
-# Ensure the script runs with administrative privileges
+#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
-[CmdletBinding(PositionalBinding=$False)]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [switch]$Detect,
-    [switch]$Clean,
-    [switch]$Help,
+    [ValidateRange(1, 3650)]
     [int]$Days = 30
 )
 
-function Show-Help {
-    @"
-Usage: .\Clear-CCMCache.ps1 [-Detect] [-Clean] [-Help] [-Days ##]
+$ErrorActionPreference = 'Stop'
+$CcmNamespace = 'ROOT\ccm\SoftMgmtAgent'
 
--Detect : Detect old and unused content in the CCMCache folder.
--Clean  : Clean old and unused content from the CCMCache folder. If no option is provided, this is the default.
--Help   : Show this help message.
--Days   : Set the number of days to keep files in the CCMCache folder. Default is 30 days.
-
-Examples:
-  .\Clear-CCMCache.ps1 -Detect
-  .\Clear-CCMCache.ps1 -Clean
-  .\Clear-CCMCache.ps1 -Help
-  .\Clear-CCMCache.ps1 -Clean -Days 14
-  .\Clear-CCMCache.ps1 -Detect -Days 14
-"@
+function Test-PathUnder {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Parent
+    )
+    try {
+        $p = [System.IO.Path]::GetFullPath($Path).TrimEnd('\') + '\'
+        $r = [System.IO.Path]::GetFullPath($Parent).TrimEnd('\') + '\'
+        return $p.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
 }
 
-if ($Help) {
-    Show-Help
-    exit
-}
-
-if (-not $Detect -and -not $Clean) {
-    $Clean = $true
-}
-
-# Check PowerShell version
-if ($PSVersionTable.PSVersion.Major -ge 7) {
-    Write-Error "This script does not support PowerShell 7.x. Please use Windows PowerShell 5.1. Exiting..."
-    exit 1
-}
-
-# Get CCMCache path
+# Resolve the cache root from the CCM client
 try {
-    $CachePath = (Get-WmiObject -Namespace "ROOT\ccm\SoftMgmtAgent" -Class "CacheConfig" -Filter "ConfigKey='Cache'").Location
+    $CacheConfig = Get-CimInstance -Namespace $CcmNamespace -ClassName CacheConfig -Filter "ConfigKey='Cache'"
 } catch {
-    Write-Error "Failed to retrieve CCMCache path. Exiting script."
+    Write-Error "Failed to query CacheConfig in $CcmNamespace. Is the CCM client installed? $_"
     exit 1
 }
 
-# Test if the $CachePath was successfully retrieved and exit script if not
-if ([string]::IsNullOrEmpty($CachePath)) {
-    Write-Error "CachePath is null or empty. Exiting script."
+$CachePath = $CacheConfig.Location
+if ([string]::IsNullOrWhiteSpace($CachePath)) {
+    Write-Error "CCM cache path is empty."
+    exit 1
+}
+if (-not (Test-Path -LiteralPath $CachePath)) {
+    Write-Error "CCM cache path '$CachePath' does not exist on disk."
+    exit 1
+}
+Write-Verbose "CCM cache path: $CachePath"
+
+# Pull the cache index once
+try {
+    $CacheEntries = @(Get-CimInstance -Namespace $CcmNamespace -ClassName CacheInfoEx)
+} catch {
+    Write-Error "Failed to query CacheInfoEx. $_"
     exit 1
 }
 
-# Get items not referenced for more than the specified days
-$OldCache = Get-WmiObject -Query "SELECT * FROM CacheInfoEx" -Namespace "ROOT\ccm\SoftMgmtAgent" | Where-Object {
-    ($([datetime]::Now) - ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.LastReferenced))).Days -gt $Days
+$Now = Get-Date
+$Stale = $CacheEntries | Where-Object { ($Now - $_.LastReferenced).Days -gt $Days }
+
+if ($Stale) {
+    Write-Verbose "Found $($Stale.Count) stale cache entries (older than $Days days)."
+    foreach ($entry in $Stale) {
+        $location = $entry.Location
+        $target = "$location (last referenced $($entry.LastReferenced))"
+        if (-not $PSCmdlet.ShouldProcess($target, 'Remove stale cache entry')) { continue }
+
+        if (-not (Test-PathUnder -Path $location -Parent $CachePath)) {
+            Write-Warning "Skipping '$location' — not under cache root '$CachePath'."
+            continue
+        }
+
+        if (Test-Path -LiteralPath $location) {
+            try {
+                Remove-Item -LiteralPath $location -Recurse -Force -ErrorAction Stop
+                Write-Verbose "Deleted folder: $location"
+            } catch {
+                Write-Warning "Failed to delete folder '$location': $_"
+            }
+        }
+
+        try {
+            Remove-CimInstance -InputObject $entry -ErrorAction Stop
+            Write-Verbose "Removed CIM entry: $location"
+        } catch {
+            Write-Warning "Failed to remove CIM entry for '$location': $_"
+        }
+    }
+} else {
+    Write-Verbose "No stale cache entries."
 }
 
-if ($Detect) {
-    if ($OldCache) {
-        Write-Output "Old and unused content detected:"
-        $OldCache | Select-Object Location, LastReferenced
-    } else {
-        Write-Output "No old or unused content found."
+# Reconcile orphans against current state
+try {
+    $RemainingCim = @(Get-CimInstance -Namespace $CcmNamespace -ClassName CacheInfoEx)
+} catch {
+    Write-Error "Failed to re-query CacheInfoEx for orphan reconciliation. $_"
+    exit 1
+}
+
+try {
+    $DiskFolders = @(Get-ChildItem -LiteralPath $CachePath -Directory -ErrorAction Stop |
+        Select-Object -ExpandProperty FullName)
+} catch {
+    Write-Error "Failed to enumerate folders under '$CachePath'. $_"
+    exit 1
+}
+
+$cmp = [System.StringComparer]::OrdinalIgnoreCase
+$CimSet  = [System.Collections.Generic.HashSet[string]]::new([string[]]@($RemainingCim | ForEach-Object { $_.Location }), $cmp)
+$DiskSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$DiskFolders, $cmp)
+
+# Disk folders with no CIM record
+foreach ($folder in $DiskFolders) {
+    if ($CimSet.Contains($folder)) { continue }
+    if (-not $PSCmdlet.ShouldProcess($folder, 'Remove orphaned folder (no CIM record)')) { continue }
+    if (-not (Test-PathUnder -Path $folder -Parent $CachePath)) {
+        Write-Warning "Skipping '$folder' — not under cache root '$CachePath'."
+        continue
+    }
+    try {
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction Stop
+        Write-Verbose "Removed orphaned folder: $folder"
+    } catch {
+        Write-Warning "Failed to remove orphaned folder '$folder': $_"
     }
 }
 
-if ($Clean) {
-    if ($OldCache) {
-        # Delete items on disk
-        $OldCache | ForEach-Object { 
-            try {
-                Remove-Item -Path $_.Location -Recurse -Force -ErrorAction Stop 
-                Write-Output "Deleted: $_.Location"
-            } catch {
-                Write-Warning "Failed to delete: $_.Location"
-            }
-        }
-
-        # Delete items in WMI
-        $OldCache | ForEach-Object {
-            try {
-                $_ | Remove-WmiObject -ErrorAction Stop
-                Write-Output "Removed WMI object: $_.Location"
-            } catch {
-                Write-Warning "Failed to remove WMI object: $_.Location"
-            }
-        }
-    } else {
-        Write-Output "No old or unused content to clean."
-    }
-
-    # Get all cached items from disk
+# CIM records pointing at folders that no longer exist
+foreach ($entry in $RemainingCim) {
+    $location = $entry.Location
+    if ($DiskSet.Contains($location)) { continue }
+    if (-not $PSCmdlet.ShouldProcess($location, 'Remove orphaned CIM record (folder missing)')) { continue }
     try {
-        $CacheFoldersDisk = Get-ChildItem -Path $CachePath -ErrorAction Stop | Select-Object -ExpandProperty FullName
+        Remove-CimInstance -InputObject $entry -ErrorAction Stop
+        Write-Verbose "Removed orphaned CIM entry: $location"
     } catch {
-        Write-Error "Failed to retrieve cached items from disk. Exiting script."
-        exit 1
-    }
-
-    # Get all cached items from WMI
-    try {
-        $CacheFoldersWMI = Get-WmiObject -Query "SELECT * FROM CacheInfoEx" -Namespace "ROOT\ccm\SoftMgmtAgent" | Select-Object -ExpandProperty Location
-    } catch {
-        Write-Error "Failed to retrieve cached items from WMI. Exiting script."
-        exit 1
-    }
-
-    # Remove orphaned folders from disk
-    $OrphanedFolders = $CacheFoldersDisk | Where-Object { $_ -notin $CacheFoldersWMI }
-    foreach ($folder in $OrphanedFolders) {
-        try {
-            Remove-Item -Path $folder -Recurse -Force -ErrorAction Stop
-            Write-Output "Removed orphaned folder from disk: $folder"
-        } catch {
-            Write-Warning "Failed to remove orphaned folder: $folder"
-        }
-    }
-
-    # Remove orphaned WMI objects
-    $OrphanedWMIObjects = $CacheFoldersWMI | Where-Object { $_ -notin $CacheFoldersDisk }
-    foreach ($wmiObj in $OrphanedWMIObjects) {
-        try {
-            $wmiObject = Get-WmiObject -Namespace "ROOT\ccm\SoftMgmtAgent" -Query "SELECT * FROM CacheInfoEx WHERE Location='$wmiObj'"
-            if ($wmiObject) {
-                $wmiObject | Remove-WmiObject -ErrorAction Stop
-                Write-Output "Removed orphaned WMI object: $wmiObj"
-            }
-        } catch {
-            Write-Warning "Failed to remove orphaned WMI object: $wmiObj"
-        }
+        Write-Warning "Failed to remove orphaned CIM entry for '$location': $_"
     }
 }
