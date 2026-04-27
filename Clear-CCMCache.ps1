@@ -161,7 +161,7 @@ $Removed = 0
 $SkippedRecent = 0
 $SkippedPersisted = 0
 $SkippedInUse = 0
-$SkippedNoCim = 0
+$ComOnly = 0
 $Failed = 0
 
 foreach ($com in $ComElements) {
@@ -170,32 +170,42 @@ foreach ($com in $ComElements) {
     $key      = ConvertTo-NormalizedGuid $id
     $cim      = if ($key) { $CimById[$key] } else { $null }
 
-    if (-not $cim) {
-        # Element missing from CIM index — leave it for the orphan pass to resolve safely.
-        Write-Verbose "Skipping (no CIM record, deferring to orphan pass): $location"
-        $SkippedNoCim++
-        continue
+    # Use CIM filter properties when available; fall back to COM's own when the CIM
+    # record is missing. A missing CIM twin means the element is a "COM-only ghost":
+    # ccmexec still tracks it but the index doesn't, typically from prior unsupported
+    # cleanups. DeleteCacheElement is the only way to flush ccmexec's internal state.
+    if ($cim) {
+        $lastRef  = $cim.LastReferenced
+        $refCount = $cim.ReferenceCount
+        $persist  = [bool]$cim.PersistInCache
+        $source   = 'cim'
+    } else {
+        $lastRef  = $com.LastReferenceTime
+        $refCount = $com.ReferenceCount
+        $persist  = $false
+        $source   = 'com-only'
+        $ComOnly++
     }
 
-    $idleDays = ($Now - $cim.LastReferenced).Days
+    $idleDays = ($Now - $lastRef).Days
     if ($idleDays -le $Days) {
         $SkippedRecent++
         continue
     }
 
-    if ($cim.PersistInCache -and -not $IncludePersisted) {
+    if ($persist -and -not $IncludePersisted) {
         Write-Verbose "Skipping persisted: $location (use -IncludePersisted to override)."
         $SkippedPersisted++
         continue
     }
 
-    if ($cim.ReferenceCount -gt 0 -and -not $IncludeInUse) {
-        Write-Verbose "Skipping in-use: $location (ReferenceCount=$($cim.ReferenceCount); use -IncludeInUse to override)."
+    if ($refCount -gt 0 -and -not $IncludeInUse) {
+        Write-Verbose "Skipping in-use: $location (ref=$refCount; use -IncludeInUse to override)."
         $SkippedInUse++
         continue
     }
 
-    $target = "$location (idle $idleDays d, ref=$($cim.ReferenceCount), persist=$($cim.PersistInCache))"
+    $target = "$location (idle $idleDays d, ref=$refCount, persist=$persist, src=$source)"
     if (-not $PSCmdlet.ShouldProcess($target, 'Delete cache element via CCM COM interface')) { continue }
 
     try {
@@ -203,13 +213,13 @@ foreach ($com in $ComElements) {
         Write-Verbose "Deleted: $location"
         $Removed++
     } catch {
-        Write-Warning "DeleteCacheElement refused/failed for '$location' (id=$id): $_"
+        Write-Warning "DeleteCacheElement refused/failed for '$location' (id=$id, src=$source): $_"
         $Failed++
     }
 }
 
-Write-Verbose ("Main pass: removed={0} recent={1} persisted={2} in-use={3} no-cim={4} failed={5}" -f `
-    $Removed, $SkippedRecent, $SkippedPersisted, $SkippedInUse, $SkippedNoCim, $Failed)
+Write-Verbose ("Main pass: removed={0} recent={1} persisted={2} in-use={3} com-only-ghosts={4} failed={5}" -f `
+    $Removed, $SkippedRecent, $SkippedPersisted, $SkippedInUse, $ComOnly, $Failed)
 
 # --- orphan reconciliation (legacy/interrupted-state cleanup) ----------------
 
