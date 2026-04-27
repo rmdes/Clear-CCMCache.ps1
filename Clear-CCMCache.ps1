@@ -416,6 +416,11 @@ try {
 }
 
 try {
+    # No -Force here, deliberately. The cache root holds CCM-managed marker files
+    # (e.g., skpswi.dat, the "skip software inventory" sentinel) and may grow hidden
+    # scratch directories in future CCM versions. The orphan pass treats any disk
+    # folder without a CIM record as deletable; adding -Force could cause us to
+    # reap CCM scratch we shouldn't touch. Visible folders only is the safe set.
     $DiskFolders = @(Get-ChildItem -LiteralPath $CachePath -Directory -ErrorAction Stop |
         Select-Object -ExpandProperty FullName)
 } catch {
@@ -528,6 +533,7 @@ if ($MaxSizeMB -gt 0) {
 # or staged inside each cache folder. After any real removals, re-walk the cache
 # root for the honest reclaim number and refresh the over-target warning.
 
+$finalDiskKB = $StartDiskKB
 $realRemovals = @($Script:Records | Where-Object Status -eq 'Removed').Count
 if ($realRemovals -gt 0) {
     $finalDiskKB = Get-FolderSizeKB -Path $CachePath
@@ -570,3 +576,17 @@ $summary += " skipped=$($skipped.Count) failed=$($failed.Count)"
 $finalSeverity = if ($failed.Count) { 'Warning' } else { 'Info' }
 Write-Verbose $summary
 Write-CMTraceLog -Message "=== $summary ===" -Severity $finalSeverity
+
+# --- exit code ---------------------------------------------------------------
+# 0 = clean run
+# 1 = preflight failure (handled earlier via Stop-WithError)
+# 2 = run completed but with per-item failures
+# 3 = -MaxSizeMB set and cache still over target after the run
+
+$exitCode = 0
+if ($failed.Count -gt 0) {
+    $exitCode = 2
+} elseif ($MaxSizeMB -gt 0 -and $finalDiskKB -gt ([long]$MaxSizeMB * 1024)) {
+    $exitCode = 3
+}
+exit $exitCode

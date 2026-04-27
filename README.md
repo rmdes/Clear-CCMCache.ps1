@@ -82,6 +82,24 @@ In `-WhatIf` mode it also reports `would-remove=N projected=N` so you can previe
 
 Every destructive step honors `-WhatIf` and `-Confirm`, and disk deletions are bounded to paths under the resolved cache root as a safety guard.
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Clean run. No per-item failures; if `-MaxSizeMB` was set, the cache is now under target. |
+| `1` | Preflight failed (no CCM client, CcmExec not running, cache path missing, COM bind failed). |
+| `2` | Run completed but one or more removals failed (`failed > 0` in the summary). |
+| `3` | `-MaxSizeMB` was set and the cache is still over target after the run. |
+
+Use these for SCCM / Intune / scheduled-task conditional logic. See [`Examples/`](Examples/) for deployment templates.
+
+## Deployment
+
+See the [`Examples/`](Examples/) folder for ready-to-use templates:
+
+- **`Intune-Detect.ps1` + `Intune-Remediate.ps1`** — Proactive Remediation script pair.
+- **`Install-ScheduledTask.ps1`** — registers a weekly Windows scheduled task running as SYSTEM.
+
 ## Notes
 
 - The default cache path is `C:\Windows\ccmcache`, but the script always reads the actual location from CIM.

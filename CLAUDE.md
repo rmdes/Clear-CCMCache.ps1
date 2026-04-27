@@ -4,9 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A single PowerShell script — `Clear-CCMCache.ps1` — that cleans the SCCM/CCM client cache on Windows endpoints. There is no build system, no test framework, no CI pipeline, and no other source files. The whole codebase is the script and the README.
+A PowerShell script — `Clear-CCMCache.ps1` — that cleans the SCCM/CCM client cache on Windows endpoints, plus an `Examples/` folder of deployment templates (Intune Proactive Remediation pair, scheduled-task installer). No build system, no test framework, no CI pipeline.
 
 This is a personal fork of `VirtualOx/Clear-CCMCache.ps1`. Backward compatibility with upstream is not a goal; breaking changes are fine.
+
+## Exit codes
+
+The script exits with one of: `0` clean, `1` preflight failed, `2` per-item failures, `3` `-MaxSizeMB` target not met. Callers (Examples/, scheduled tasks, MECM scripts) use these for conditional logic. When adding new error/warning paths, decide which code applies and `exit` explicitly — don't fall through to implicit `exit 0`.
 
 ## Validating changes
 
@@ -56,6 +60,7 @@ Easy to break by accident — keep them in mind when editing:
 - **CIM, not WMI.** Never reintroduce `Get-WmiObject` / `Remove-WmiObject`; they are removed in PS 7. The script must run unchanged on PS 5.1 and PS 7+, which is why CIM cmdlets are used and why `#Requires -Version 5.1` (not 7) is set.
 - **Case-insensitive path comparison is load-bearing.** CIM returns the cache path in different casing than `Get-ChildItem` does (`C:\windows\ccmcache` vs `C:\Windows\ccmcache` on the same machine). The orphan diff uses `[StringComparer]::OrdinalIgnoreCase` `HashSet[string]` for this reason. Replacing it with `-notin` or a default-comparer hashset will cause every disk folder to look like a false orphan and get deleted.
 - **`Test-PathUnder` guards every `Remove-Item`.** The orphan pass runs as administrator with `-Recurse -Force`. Any new deletion path must verify the target is under the resolved `$CachePath` before calling `Remove-Item`. Don't shortcut this.
+- **Orphan-pass disk enumeration deliberately omits `-Force`.** The cache root holds CCM-managed marker files (`skpswi.dat`) and may grow hidden scratch directories in future CCM versions. The orphan rule "any disk folder without a CIM record is deletable" combined with `-Force` would risk reaping CCM internals. Don't "fix" this by adding `-Force` — the safe set is visible folders only.
 - **Destructive operations go through `$PSCmdlet.ShouldProcess(...)`.** This is what powers `-WhatIf` / `-Confirm`. New destructive steps must follow the same pattern, not bypass it.
 - **`ABOUTME:` header.** The two `# ABOUTME:` lines at the top of the script are per the maintainer's global convention. Keep them; if the script's purpose changes, update them.
 
