@@ -87,6 +87,16 @@ function Stop-WithError {
     exit 1
 }
 
+# COM CacheElementId comes back as '{UPPER-WITH-BRACES}'; CIM CacheId as 'lower-no-braces'.
+# Normalize both sides through [Guid] so the join key is identical.
+function ConvertTo-NormalizedGuid {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $g = [Guid]::Empty
+    if ([Guid]::TryParse($Value, [ref]$g)) { return $g.ToString('D') }
+    return $null
+}
+
 # --- preflight ---------------------------------------------------------------
 
 $svc = Get-Service -Name CcmExec -ErrorAction SilentlyContinue
@@ -138,7 +148,11 @@ try {
 }
 
 $CimById = @{}
-foreach ($e in $CimEntries) { $CimById[$e.CacheId] = $e }
+foreach ($e in $CimEntries) {
+    $key = ConvertTo-NormalizedGuid $e.CacheId
+    if ($key) { $CimById[$key] = $e }
+}
+Write-Verbose "Indexed $($CimById.Count) CIM cache entries; enumerated $($ComElements.Count) COM cache elements."
 
 # --- main pass ---------------------------------------------------------------
 
@@ -153,7 +167,8 @@ $Failed = 0
 foreach ($com in $ComElements) {
     $id       = $com.CacheElementId
     $location = $com.Location
-    $cim      = $CimById[$id]
+    $key      = ConvertTo-NormalizedGuid $id
+    $cim      = if ($key) { $CimById[$key] } else { $null }
 
     if (-not $cim) {
         # Element missing from CIM index — leave it for the orphan pass to resolve safely.
