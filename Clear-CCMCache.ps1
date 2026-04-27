@@ -1,35 +1,54 @@
-# ABOUTME: Removes old/unused content and reconciles orphaned entries in the SCCM/CCM client cache.
-# ABOUTME: Uses CIM cmdlets, so it runs unchanged on Windows PowerShell 5.1 and PowerShell 7+.
+# ABOUTME: Removes old/unused content from the SCCM/CCM client cache via the supported COM interface.
+# ABOUTME: Honors PersistInCache and ReferenceCount; runs on Windows PowerShell 5.1 and PowerShell 7+.
 
 <#
 .SYNOPSIS
 Clears old and unused content from the CCMCache folder.
 
 .DESCRIPTION
-Removes cache entries whose LastReferenced timestamp is older than -Days (folder on disk
-plus the matching CIM record), then reconciles orphans between disk and the CCM client
-store: disk folders with no CIM record are removed, and CIM records pointing at missing
-folders are removed.
+Removes cache entries whose LastReferenced timestamp is older than -Days using the
+supported UIResource.UIResourceMgr COM interface — the same API the CCM client uses
+internally — so disk and the cache index stay consistent and locked items are
+respected.
 
-Use -WhatIf to preview without making changes, or -Confirm to be prompted per item.
+By default, the script skips:
+  * Persisted entries (PersistInCache = $true) — deleting them triggers redownload on
+    the next policy evaluation, which at scale becomes a bandwidth event.
+  * In-use entries (ReferenceCount > 0) — they are being read by a running install
+    or task sequence and deleting them mid-flight will break the deployment.
+
+Override these defaults with -IncludePersisted and -IncludeInUse.
+
+After the main pass, a best-effort orphan reconciliation runs to clean up legacy
+inconsistencies between disk folders and the CIM index (typically left behind by
+older, unsupported cleanup scripts or interrupted operations).
+
+Use -WhatIf to preview, or -Confirm to be prompted per item.
 
 .PARAMETER Days
 Number of days an item must be unreferenced before it is considered stale. Default: 30.
 
+.PARAMETER IncludePersisted
+Also remove entries flagged PersistInCache = $true. Off by default.
+
+.PARAMETER IncludeInUse
+Also attempt to remove entries with ReferenceCount > 0. Off by default. The COM
+interface may still refuse the delete if the content is actively locked.
+
 .EXAMPLE
 .\Clear-CCMCache.ps1
-Cleans entries unreferenced for more than 30 days (default).
+Cleans entries unreferenced for more than 30 days, skipping persisted/in-use.
 
 .EXAMPLE
 .\Clear-CCMCache.ps1 -Days 14 -WhatIf
-Previews what a 14-day cleanup would remove, without changing anything.
+Previews a 14-day cleanup without making changes.
 
 .EXAMPLE
-.\Clear-CCMCache.ps1 -Days 14 -Verbose
-Runs a 14-day cleanup with per-item progress on the verbose stream.
+.\Clear-CCMCache.ps1 -Days 7 -IncludePersisted -Verbose
+Aggressive cleanup including persisted content (will likely trigger redownloads).
 
 .NOTES
-Requires administrative privileges and a working CCM client.
+Requires administrative privileges and a running CCM client service (CcmExec).
 Run `Get-Help .\Clear-CCMCache.ps1 -Detailed` for full help.
 #>
 
@@ -39,7 +58,10 @@ Run `Get-Help .\Clear-CCMCache.ps1 -Detailed` for full help.
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [ValidateRange(1, 3650)]
-    [int]$Days = 30
+    [int]$Days = 30,
+
+    [switch]$IncludePersisted,
+    [switch]$IncludeInUse
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,89 +81,143 @@ function Test-PathUnder {
     }
 }
 
-# Resolve the cache root from the CCM client
+function Stop-WithError {
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Error -ErrorAction Continue -Message $Message
+    exit 1
+}
+
+# --- preflight ---------------------------------------------------------------
+
+$svc = Get-Service -Name CcmExec -ErrorAction SilentlyContinue
+if (-not $svc) {
+    Stop-WithError "CCM client service (CcmExec) is not installed on this machine."
+}
+if ($svc.Status -ne 'Running') {
+    Stop-WithError "CCM client service (CcmExec) is '$($svc.Status)'. Start it before running — the supported COM interface needs a live client."
+}
+
 try {
     $CacheConfig = Get-CimInstance -Namespace $CcmNamespace -ClassName CacheConfig -Filter "ConfigKey='Cache'"
 } catch {
-    Write-Error "Failed to query CacheConfig in $CcmNamespace. Is the CCM client installed? $_"
-    exit 1
+    Stop-WithError "Failed to query CacheConfig in $CcmNamespace. Is the CCM client healthy? $_"
 }
 
 $CachePath = $CacheConfig.Location
 if ([string]::IsNullOrWhiteSpace($CachePath)) {
-    Write-Error "CCM cache path is empty."
-    exit 1
+    Stop-WithError "CCM cache path is empty."
 }
 if (-not (Test-Path -LiteralPath $CachePath)) {
-    Write-Error "CCM cache path '$CachePath' does not exist on disk."
-    exit 1
+    Stop-WithError "CCM cache path '$CachePath' does not exist on disk."
 }
 Write-Verbose "CCM cache path: $CachePath"
 
-# Pull the cache index once
+# --- bind to the supported COM interface -------------------------------------
+
 try {
-    $CacheEntries = @(Get-CimInstance -Namespace $CcmNamespace -ClassName CacheInfoEx)
+    $UIResMgr = New-Object -ComObject UIResource.UIResourceMgr
+    $CacheCom = $UIResMgr.GetCacheInfo()
 } catch {
-    Write-Error "Failed to query CacheInfoEx. $_"
-    exit 1
+    Stop-WithError "Failed to bind to UIResource.UIResourceMgr. Is the CCM client healthy? $_"
 }
+
+# --- gather state from COM (deletion handle) and CIM (filter properties) -----
+# COM CacheElement exposes ID, Location, LastReferenceTime, ReferenceCount but
+# NOT PersistInCache — that flag lives only on the CIM CacheInfoEx class.
+
+try {
+    $ComElements = @($CacheCom.GetCacheElements())
+} catch {
+    Stop-WithError "Failed to enumerate cache elements via COM. $_"
+}
+
+try {
+    $CimEntries = @(Get-CimInstance -Namespace $CcmNamespace -ClassName CacheInfoEx)
+} catch {
+    Stop-WithError "Failed to query CacheInfoEx for filter metadata. $_"
+}
+
+$CimById = @{}
+foreach ($e in $CimEntries) { $CimById[$e.CacheId] = $e }
+
+# --- main pass ---------------------------------------------------------------
 
 $Now = Get-Date
-$Stale = $CacheEntries | Where-Object { ($Now - $_.LastReferenced).Days -gt $Days }
+$Removed = 0
+$SkippedRecent = 0
+$SkippedPersisted = 0
+$SkippedInUse = 0
+$SkippedNoCim = 0
+$Failed = 0
 
-if ($Stale) {
-    Write-Verbose "Found $($Stale.Count) stale cache entries (older than $Days days)."
-    foreach ($entry in $Stale) {
-        $location = $entry.Location
-        $target = "$location (last referenced $($entry.LastReferenced))"
-        if (-not $PSCmdlet.ShouldProcess($target, 'Remove stale cache entry')) { continue }
+foreach ($com in $ComElements) {
+    $id       = $com.CacheElementId
+    $location = $com.Location
+    $cim      = $CimById[$id]
 
-        if (-not (Test-PathUnder -Path $location -Parent $CachePath)) {
-            Write-Warning "Skipping '$location' — not under cache root '$CachePath'."
-            continue
-        }
-
-        if (Test-Path -LiteralPath $location) {
-            try {
-                Remove-Item -LiteralPath $location -Recurse -Force -ErrorAction Stop
-                Write-Verbose "Deleted folder: $location"
-            } catch {
-                Write-Warning "Failed to delete folder '$location': $_"
-            }
-        }
-
-        try {
-            Remove-CimInstance -InputObject $entry -ErrorAction Stop
-            Write-Verbose "Removed CIM entry: $location"
-        } catch {
-            Write-Warning "Failed to remove CIM entry for '$location': $_"
-        }
+    if (-not $cim) {
+        # Element missing from CIM index — leave it for the orphan pass to resolve safely.
+        Write-Verbose "Skipping (no CIM record, deferring to orphan pass): $location"
+        $SkippedNoCim++
+        continue
     }
-} else {
-    Write-Verbose "No stale cache entries."
+
+    $idleDays = ($Now - $cim.LastReferenced).Days
+    if ($idleDays -le $Days) {
+        $SkippedRecent++
+        continue
+    }
+
+    if ($cim.PersistInCache -and -not $IncludePersisted) {
+        Write-Verbose "Skipping persisted: $location (use -IncludePersisted to override)."
+        $SkippedPersisted++
+        continue
+    }
+
+    if ($cim.ReferenceCount -gt 0 -and -not $IncludeInUse) {
+        Write-Verbose "Skipping in-use: $location (ReferenceCount=$($cim.ReferenceCount); use -IncludeInUse to override)."
+        $SkippedInUse++
+        continue
+    }
+
+    $target = "$location (idle $idleDays d, ref=$($cim.ReferenceCount), persist=$($cim.PersistInCache))"
+    if (-not $PSCmdlet.ShouldProcess($target, 'Delete cache element via CCM COM interface')) { continue }
+
+    try {
+        $CacheCom.DeleteCacheElement($id)
+        Write-Verbose "Deleted: $location"
+        $Removed++
+    } catch {
+        Write-Warning "DeleteCacheElement refused/failed for '$location' (id=$id): $_"
+        $Failed++
+    }
 }
 
-# Reconcile orphans against current state
+Write-Verbose ("Main pass: removed={0} recent={1} persisted={2} in-use={3} no-cim={4} failed={5}" -f `
+    $Removed, $SkippedRecent, $SkippedPersisted, $SkippedInUse, $SkippedNoCim, $Failed)
+
+# --- orphan reconciliation (legacy/interrupted-state cleanup) ----------------
+
 try {
     $RemainingCim = @(Get-CimInstance -Namespace $CcmNamespace -ClassName CacheInfoEx)
 } catch {
-    Write-Error "Failed to re-query CacheInfoEx for orphan reconciliation. $_"
-    exit 1
+    Write-Warning "Skipping orphan reconciliation — failed to re-query CacheInfoEx: $_"
+    return
 }
 
 try {
     $DiskFolders = @(Get-ChildItem -LiteralPath $CachePath -Directory -ErrorAction Stop |
         Select-Object -ExpandProperty FullName)
 } catch {
-    Write-Error "Failed to enumerate folders under '$CachePath'. $_"
-    exit 1
+    Write-Warning "Skipping orphan reconciliation — failed to enumerate folders under '$CachePath': $_"
+    return
 }
 
-$cmp = [System.StringComparer]::OrdinalIgnoreCase
+$cmp     = [System.StringComparer]::OrdinalIgnoreCase
 $CimSet  = [System.Collections.Generic.HashSet[string]]::new([string[]]@($RemainingCim | ForEach-Object { $_.Location }), $cmp)
 $DiskSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$DiskFolders, $cmp)
 
-# Disk folders with no CIM record
+# Disk folders with no CIM record — safe to delete: nothing in the index claims them.
 foreach ($folder in $DiskFolders) {
     if ($CimSet.Contains($folder)) { continue }
     if (-not $PSCmdlet.ShouldProcess($folder, 'Remove orphaned folder (no CIM record)')) { continue }
@@ -157,15 +233,20 @@ foreach ($folder in $DiskFolders) {
     }
 }
 
-# CIM records pointing at folders that no longer exist
+# CIM records with no folder — try the supported COM path first; fall back to manual.
 foreach ($entry in $RemainingCim) {
     $location = $entry.Location
     if ($DiskSet.Contains($location)) { continue }
     if (-not $PSCmdlet.ShouldProcess($location, 'Remove orphaned CIM record (folder missing)')) { continue }
     try {
-        Remove-CimInstance -InputObject $entry -ErrorAction Stop
-        Write-Verbose "Removed orphaned CIM entry: $location"
+        $CacheCom.DeleteCacheElement($entry.CacheId)
+        Write-Verbose "Removed orphaned cache element via COM: $location"
     } catch {
-        Write-Warning "Failed to remove orphaned CIM entry for '$location': $_"
+        try {
+            Remove-CimInstance -InputObject $entry -ErrorAction Stop
+            Write-Verbose "Removed orphaned CIM record (COM refused, manual fallback): $location"
+        } catch {
+            Write-Warning "Failed to remove orphaned CIM entry for '$location': $_"
+        }
     }
 }
