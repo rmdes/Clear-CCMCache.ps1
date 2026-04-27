@@ -51,9 +51,13 @@ Get-Help .\Clear-CCMCache.ps1 -Detailed
 
 Every action (Removed / WouldRemove / Skipped / Failed) is appended to a CMTrace-formatted log alongside the rest of the CCM client logs (default `%SystemRoot%\CCM\Logs\ClearCache.log`). Open it with `CMTrace.exe` to see runs interleaved with `CcmExec.log`, `CAS.log`, etc. The log auto-rotates to `ClearCache.lo_` when it crosses 10 MB.
 
+Each run also logs the **cache utilization** at start: actual on-disk size, configured maximum (read from `CacheConfig.Size`), percent used, and headroom — the headline numbers an admin needs to decide whether a cleanup is even necessary.
+
 The verbose summary line at the end of every run looks like:
 
 ```
+Cache utilization: 850.42 MB on disk / 25.00 GB max (3.3% used, 24.17 GB headroom)
+...
 Run finished: removed=33 reclaimed=4.21 GB skipped=7 failed=0
 ```
 

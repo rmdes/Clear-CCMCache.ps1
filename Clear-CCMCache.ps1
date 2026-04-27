@@ -164,6 +164,34 @@ function Get-FolderSizeKB {
     } catch { return 0 }
 }
 
+# Use InvariantCulture so logs are consistent regardless of the operator's locale —
+# PowerShell's -f operator defaults to CurrentCulture, "$var" interpolation to
+# Invariant, and that asymmetry makes mixed output (10,96 GB ... 109.6%) ugly.
+$Script:InvCulture = [System.Globalization.CultureInfo]::InvariantCulture
+
+function Format-Size {
+    param([long]$KB)
+    if ($KB -ge 1GB / 1KB) { return [string]::Format($Script:InvCulture, '{0:N2} GB', $KB / (1GB / 1KB)) }
+    if ($KB -ge 1MB / 1KB) { return [string]::Format($Script:InvCulture, '{0:N2} MB', $KB / (1MB / 1KB)) }
+    return [string]::Format($Script:InvCulture, '{0} KB', $KB)
+}
+
+function Format-Utilization {
+    param(
+        [Parameter(Mandatory)][long]$DiskKB,
+        [int]$ConfiguredMaxMB
+    )
+    $disk = Format-Size $DiskKB
+    if ($ConfiguredMaxMB -gt 0) {
+        $maxKB = [long]$ConfiguredMaxMB * 1024
+        $pct = if ($maxKB -gt 0) { [math]::Round(($DiskKB / $maxKB) * 100, 1) } else { 0 }
+        $pctStr = $pct.ToString($Script:InvCulture)
+        $headroomKB = [Math]::Max(0, $maxKB - $DiskKB)
+        return "$disk on disk / $(Format-Size $maxKB) max ($pctStr% used, $(Format-Size $headroomKB) headroom)"
+    }
+    return "$disk on disk (max not configured)"
+}
+
 function Add-Record {
     param(
         [Parameter(Mandatory)][ValidateSet('Removed', 'WouldRemove', 'Skipped', 'Failed')][string]$Status,
@@ -249,6 +277,14 @@ Write-Verbose "Log file: $(if ($Script:NoLog) { '(disabled)' } else { $Script:Lo
 
 $whatIf = $WhatIfPreference -eq $true -or $PSBoundParameters.ContainsKey('WhatIf')
 Write-CMTraceLog -Message "=== Run started: Days=$Days IncludePersisted=$IncludePersisted IncludeInUse=$IncludeInUse WhatIf=$whatIf CachePath=$CachePath ===" -Severity Info
+
+# Cache utilization snapshot — reads on-disk size (authoritative) and the configured
+# max from CacheConfig.Size (in MB). The walk can take a moment on large caches.
+$ConfiguredMaxMB = [int]($CacheConfig.Size)
+$StartDiskKB = Get-FolderSizeKB -Path $CachePath
+$utilLine = "Cache utilization: $(Format-Utilization -DiskKB $StartDiskKB -ConfiguredMaxMB $ConfiguredMaxMB)"
+Write-Verbose $utilLine
+Write-CMTraceLog -Message $utilLine -Severity Info
 
 # --- bind to the supported COM interface -------------------------------------
 
@@ -410,13 +446,6 @@ $failed      = @($Script:Records | Where-Object Status -eq 'Failed')
 
 $reclaimedKB = ($removed | Measure-Object SizeKB -Sum).Sum
 $projectedKB = ($wouldRemove | Measure-Object SizeKB -Sum).Sum
-
-function Format-Size {
-    param([long]$KB)
-    if ($KB -ge 1GB / 1KB) { return ("{0:N2} GB" -f ($KB / (1GB / 1KB))) }
-    if ($KB -ge 1MB / 1KB) { return ("{0:N2} MB" -f ($KB / (1MB / 1KB))) }
-    return ("{0} KB" -f $KB)
-}
 
 $summary = "Run finished: removed=$($removed.Count) reclaimed=$(Format-Size $reclaimedKB)"
 if ($wouldRemove.Count) { $summary += " would-remove=$($wouldRemove.Count) projected=$(Format-Size $projectedKB)" }
