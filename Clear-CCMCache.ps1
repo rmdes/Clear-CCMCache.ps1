@@ -222,6 +222,9 @@ function Add-Record {
         Error     = $ErrorMsg
     }
     $Script:Records.Add($rec)
+    # Captured here (not via indexer) so callers get the exact reference
+    # List.Remove() will match in equality checks.
+    $Script:LastRecord = $rec
 
     $sev = if ($Status -eq 'Failed') { 'Warning' } else { 'Info' }
     $msg = "$Status $Path"
@@ -360,8 +363,10 @@ foreach ($com in $ComElements) {
 
     $idleDays = ($Now - $lastRef).Days
     if ($idleDays -le $Days) {
+        Add-Record -Status 'Skipped' -Path $location -SizeKB $sizeKB -Source $source -Reason "recent (idle $idleDays d <= $Days)"
         $eligibleForMaxSize = -not ($persist -and -not $IncludePersisted) -and -not ($refCount -gt 0 -and -not $IncludeInUse)
         if ($MaxSizeMB -gt 0 -and $eligibleForMaxSize) {
+            # Stash the just-added Skipped record so the bonus pass can drop it on promotion.
             $RecentCandidates.Add([PSCustomObject]@{
                 ComElement     = $com
                 Location       = $location
@@ -369,9 +374,9 @@ foreach ($com in $ComElements) {
                 IdleDays       = $idleDays
                 SizeKB         = $sizeKB
                 Source         = $source
+                SkippedRecord  = $Script:LastRecord
             })
         }
-        Add-Record -Status 'Skipped' -Path $location -SizeKB $sizeKB -Source $source -Reason "recent (idle $idleDays d <= $Days)"
         continue
     }
 
@@ -491,6 +496,8 @@ if ($MaxSizeMB -gt 0) {
         $bonusReclaimedKB = 0
         foreach ($cand in $sorted) {
             if ($bonusReclaimedKB -ge $excessKB) { break }
+            # Promote: drop the earlier Skipped record so the summary doesn't double-count.
+            if ($cand.SkippedRecord) { [void]$Script:Records.Remove($cand.SkippedRecord) }
             $reason = "max-size: idle $($cand.IdleDays) d, target $MaxSizeMB MB"
             $target = "$($cand.Location) ($reason)"
             if (-not $PSCmdlet.ShouldProcess($target, 'Delete cache element via CCM COM interface (max-size pass)')) {
